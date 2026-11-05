@@ -1,0 +1,250 @@
+name: A0 read-only host inventory
+'on':
+  workflow_dispatch:
+permissions: {}
+jobs:
+  observe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Observe only; admission is not a green check
+        shell: bash --noprofile --norc -e -o pipefail {0}
+        working-directory: /
+        run: |
+          exec /usr/bin/env -i \
+            PATH=/usr/bin:/bin LANG=C.UTF-8 HOME=/nonexistent \
+            A0_IMAGE_OS="$ImageOS" A0_IMAGE_VERSION="$ImageVersion" \
+            A0_RUNNER_OS="$RUNNER_OS" A0_RUNNER_ARCH="$RUNNER_ARCH" \
+            A0_WORKSPACE="$GITHUB_WORKSPACE" \
+            /usr/bin/python3 -I -S - <<'PY'
+          import datetime
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import platform
+          import shlex
+          import stat
+          import subprocess
+          import sys
+          import time
+
+          # Only explicitly forwarded metadata and stdio; never inspect home/config.
+          try:
+              for entry in os.listdir("/proc/self/fd"):
+                  if int(entry) > 2:
+                      try:
+                          os.close(int(entry))
+                      except OSError as error:
+                          if error.errno != 9:  # Enumeration may already have closed its FD.
+                              raise
+          except OSError:
+              print('A0_SETUP_FAILURE {"observation_attempts_complete":false,"host_admission":"UNKNOWN"}')
+              sys.exit(3)
+
+          rows = []
+          def read(path, limit=16384, *, exact=False):
+              with open(path, "rb") as stream:
+                  data = stream.read(limit + 1)
+              if len(data) > limit:
+                  raise ValueError("read limit exceeded")
+              value = data.decode("utf-8", "strict")
+              return value.removesuffix("\n") if exact else value.strip()
+
+          def command(argv):
+              result = subprocess.run(
+                  argv, stdin=subprocess.DEVNULL, capture_output=True,
+                  text=True, encoding="utf-8", errors="strict",
+                  cwd="/", timeout=5, close_fds=True,
+              )
+              if len(result.stdout) + len(result.stderr) > 16384:
+                  raise ValueError("command output limit exceeded")
+              return result
+
+          def observe(name, collect, expected=None, description="Informational only"):
+              try:
+                  value = collect()
+                  decision = expected(value) if expected is not None else "info"
+                  status = ("OBSERVED" if decision == "info" else "UNKNOWN" if decision is None
+                            else "MATCH" if decision else "MISMATCH")
+                  row = dict(item=name, status=status, expected=description, value=value)
+              except Exception as error:
+                  # Never replace failed reads with zero, empty or disabled.
+                  row = dict(item=name, status="UNKNOWN", expected=description,
+                             error_type=type(error).__name__, errno=getattr(error, "errno", None),
+                             detail=str(error)[:180])
+              rows.append(row)
+              print(json.dumps(row, ensure_ascii=True), flush=True)
+
+          def os_identity():
+              fields = {}
+              for line in read("/etc/os-release").splitlines():
+                  key, separator, value = line.partition("=")
+                  if separator and key in ("ID", "VERSION_ID"):
+                      tokens = shlex.split(value, comments=True)
+                      if len(tokens) != 1 or not tokens[0]:
+                          raise ValueError("invalid required OS field")
+                      fields[key] = tokens[0]
+              if not all(fields.get(key) for key in ("ID", "VERSION_ID")):
+                  raise ValueError("missing required OS field")
+              fields.update(kernel=platform.release(), architecture=platform.machine())
+              return fields
+          observe("os_abi", os_identity,
+                  lambda v: v.get("ID") == "ubuntu" and v.get("VERSION_ID") == "24.04"
+                  and v["architecture"] == "x86_64",
+                  "Ubuntu 24.04 x86_64; distribution identity is not admission")
+          observe("image_metadata", lambda: {
+              key: os.environ.get(key) or None for key in (
+                  "A0_IMAGE_OS", "A0_IMAGE_VERSION", "A0_RUNNER_OS", "A0_RUNNER_ARCH")},
+                  lambda v: True if all(v.values()) else None,
+                  "Allowlisted image metadata present; not pinned or approved")
+          observe("wsl_kernel_marker", lambda: any(
+              marker in (platform.release() + " " + read("/proc/version")).lower()
+              for marker in ("microsoft", "wsl")),
+                  lambda v: v is False, "No WSL kernel marker; not a runtime proof")
+          observe("nonroot_uid", os.geteuid, lambda v: v != 0, "Non-root UID")
+
+          workspace = os.environ.get("A0_WORKSPACE", "")
+
+          def work_owner():
+              if not workspace:
+                  raise ValueError("workspace unavailable")
+              path = Path(workspace)
+              entries = []
+              for label, current in (("area", path), ("parent", path.parent)):
+                  info = current.lstat()
+                  entries.append(dict(role=label, uid=info.st_uid, gid=info.st_gid,
+                                      mode=oct(stat.S_IMODE(info.st_mode)),
+                                      directory=stat.S_ISDIR(info.st_mode),
+                                      group_or_other_writable=bool(info.st_mode & 0o022)))
+              return entries
+          observe("work_area_ownership", work_owner,
+                  lambda v: v[0]["uid"] == os.geteuid() and all(
+                      e["directory"] and e["uid"] in (0, os.geteuid())
+                      and not e["group_or_other_writable"] for e in v),
+                  "Owned directory/trusted parent; exclusive arena ownership NOT proved")
+
+          def filesystem():
+              if not workspace or not Path(workspace).is_dir():
+                  raise FileNotFoundError("workspace unavailable")
+              result = command(["/usr/bin/findmnt", "--json", "--target", workspace,
+                                "--output", "TARGET,SOURCE,FSTYPE,OPTIONS"])
+              if result.returncode:
+                  raise RuntimeError("findmnt failed")
+              mounts = json.loads(result.stdout)["filesystems"]
+              if len(mounts) != 1:
+                  raise ValueError("ambiguous mount")
+              return mounts[0]
+          observe("work_area_filesystem", filesystem, lambda v: v["fstype"] == "ext4",
+                  "Native ext4; mount/path isolation still requires separate proof")
+          observe("max_user_namespaces", lambda: int(read("/proc/sys/user/max_user_namespaces")),
+                  lambda v: v > 0, "Positive ceiling; creation NOT tested")
+          observe("unprivileged_userns_clone",
+                  lambda: read("/proc/sys/kernel/unprivileged_userns_clone"),
+                  lambda v: v == "1", "If exposed: 1; actual rootless creation NOT tested")
+          observe("apparmor_enabled", lambda: read("/sys/module/apparmor/parameters/enabled"))
+          observe("apparmor_userns_restriction",
+                  lambda: read("/proc/sys/kernel/apparmor_restrict_unprivileged_userns"))
+          observe("current_apparmor_context", lambda: read("/proc/self/attr/current"))
+          observe("yama_ptrace_scope", lambda: int(read("/proc/sys/kernel/yama/ptrace_scope")),
+                  lambda v: v == 1, "Exactly 1")
+
+          def binfmt():
+              root = Path("/proc/sys/fs/binfmt_misc")
+              names = sorted(p.name for p in root.iterdir() if p.name not in ("register", "status"))
+              if len(names) > 64:
+                  raise ValueError("handler listing limit exceeded")
+              return dict(status=read(root / "status"), handlers=names)
+          observe("binfmt_misc", binfmt, lambda v: not v["handlers"],
+                  "No registered handlers; unreadable/unmounted registry is UNKNOWN")
+          observe("core_pattern", lambda: read("/proc/sys/kernel/core_pattern"),
+                  lambda v: not v.startswith("|"), "Non-pipe core pattern")
+          observe("suid_dumpable", lambda: int(read("/proc/sys/fs/suid_dumpable")),
+                  lambda v: v == 0, "Exactly 0")
+          observe("modprobe_helper", lambda: read("/proc/sys/kernel/modprobe", exact=True),
+                  lambda v: v == "", "Empty helper path")
+
+          observe("self_namespace_links", lambda: {
+              key: os.readlink("/proc/self/ns/" + key)
+              for key in ("user", "mnt", "pid", "net", "ipc", "uts")})
+          observe("self_proc_fields", lambda: {
+              key: value.strip() for line in read("/proc/self/status").splitlines()
+              for key, separator, value in [line.partition(":")]
+              if separator and key in ("Uid", "Gid", "NoNewPrivs", "Seccomp", "Seccomp_filters")})
+          observe("seccomp_actions_metadata", lambda: read("/proc/sys/kernel/seccomp/actions_avail"))
+          observe("python_pidfd_api_present", lambda: hasattr(os, "pidfd_open"))
+
+          def package():
+              result = command([
+                  "/usr/bin/dpkg-query", "-W",
+                  "-f=${db:Status-Status}\t${Version}\t${Architecture}\t${source:Package}\t${source:Version}\n",
+                  "bubblewrap"])
+              if result.returncode == 1 and result.stderr.strip().endswith(
+                      "no packages found matching bubblewrap"):
+                  return dict(installed=False, metadata="No matching installed package record")
+              if result.returncode:
+                  raise RuntimeError("dpkg-query failed")
+              fields = result.stdout.strip().split("\t")
+              if len(fields) != 5:
+                  raise ValueError("unexpected package metadata")
+              return dict(zip(("status", "version", "architecture", "source", "source_version"), fields))
+          observe("bubblewrap_dpkg_metadata", package)
+
+          def binary():
+              path = Path("/usr/bin/bwrap")
+              info = path.lstat()
+              if not stat.S_ISREG(info.st_mode):
+                  raise ValueError("not a regular system binary")
+              with path.open("rb") as stream:
+                  data = stream.read(16777217)
+              if len(data) > 16777216:
+                  raise ValueError("binary read limit exceeded")
+              return dict(uid=info.st_uid, gid=info.st_gid,
+                          mode=oct(stat.S_IMODE(info.st_mode)), bytes=len(data),
+                          installed_binary_sha256=hashlib.sha256(data).hexdigest(),
+                          note="Not a deb hash, signature, source audit or security approval")
+          observe("bubblewrap_binary_metadata", binary,
+                  lambda v: v["uid"] == 0 and not (int(v["mode"], 8) & 0o6022),
+                  "Root-owned, no set-ID/group/other-write; not provider security approval")
+
+          def apt_index_age():
+              indexes = [p for p in Path("/var/lib/apt/lists").iterdir()
+                         if p.is_file() and p.name != "lock"]
+              if not indexes:
+                  raise FileNotFoundError("no local apt indexes")
+              return dict(files=len(indexes),
+                          newest_age_hours=round((time.time() - max(p.stat().st_mtime for p in indexes)) / 3600, 2),
+                          freshness="Not refreshed; age does not prove current security status")
+          observe("local_apt_metadata_age", apt_index_age)
+          for item in (
+              "rootless_namespace_creation_and_AppArmor_admission",
+              "pidfd_operation_and_owned_init_proc_observation",
+              "mount_FD_filter_bootstrap_enforcement_and_cleanup",
+              "provider_signed_source_patch_and_current_advisory_suitability",
+              "private_exclusive_arena_and_lifetime_keyring_witnesses",
+          ):
+              row = dict(item=item, status="NOT_TESTED_CAPABILITY",
+                         reason="A0 is read-only; metadata is not execution evidence")
+              rows.append(row)
+              print(json.dumps(row), flush=True)
+
+          mismatches = [
+              dict(item=r["item"], scope="work_area" if r["item"].startswith("work_area_")
+                   else "provider_file" if r["item"] == "bubblewrap_binary_metadata"
+                   else "host_baseline")
+              for r in rows if r["status"] == "MISMATCH"]
+          unknowns = [r["item"] for r in rows if r["status"] == "UNKNOWN"]
+          exit_code = 1 if mismatches else 2
+          summary = dict(
+              observation_attempts_complete=True,
+              all_observation_reads_available=not unknowns,
+              host_admission="UNKNOWN",  # A0 cannot determine overall admission.
+              observed_conditions="MISMATCH" if mismatches else "UNKNOWN" if unknowns else "MATCH",
+              mismatches=mismatches, unknowns=unknowns,
+              native_capability_validation="NOT_TESTED", exit_code=exit_code,
+              meaning="1: scoped mismatch; 2: admission unproved. Neither asks for a retry.",
+              collected_at_utc=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+          )
+          print("A0_FINAL_SUMMARY " + json.dumps(summary), flush=True)
+          sys.exit(exit_code)
+          PY
